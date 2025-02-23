@@ -69,7 +69,7 @@ def extract_leading_formatting(text):
 def postprocess_translation(translation_text):
     return re.sub(r'\s*\{\(.*?\)\}', '', translation_text)
 
-def translate_line_openai(client, text, episode_synopsis, previous_context, original_language, target_language):
+def translate_line_openai(client, text, episode_synopsis, previous_context, original_language, target_language, model):
     formatting_codes, plain_text = extract_leading_formatting(text)
     parts = split_text_with_formatting(plain_text)
     text_to_translate = " ".join(part for is_text, part in parts if is_text).strip()
@@ -92,7 +92,7 @@ def translate_line_openai(client, text, episode_synopsis, previous_context, orig
         if not VERBOSE:
             with suppress_fd_output():
                 response = client.chat.completions.create(
-                    model="deepseek-chat" if client.api_base.startswith("https://api.deepseek") else "gpt-3.5-turbo",
+                    model=model,
                     messages=messages,
                     stream=False,
                     max_tokens=8192,
@@ -100,7 +100,7 @@ def translate_line_openai(client, text, episode_synopsis, previous_context, orig
                 )
         else:
             response = client.chat.completions.create(
-                model="deepseek-chat" if client.api_base.startswith("https://api.deepseek") else "gpt-3.5-turbo",
+                model=model,
                 messages=messages,
                 stream=False,
                 max_tokens=8192,
@@ -117,7 +117,7 @@ def translate_line_openai(client, text, episode_synopsis, previous_context, orig
     translation_text = postprocess_translation(translation_text)
     return f"{formatting_codes}{translation_text}"
 
-def translate_line_claude(claude_key, text, episode_synopsis, previous_context, original_language, target_language):
+def translate_line_claude(claude_key, text, episode_synopsis, previous_context, original_language, target_language, model):
     formatting_codes, plain_text = extract_leading_formatting(text)
     parts = split_text_with_formatting(plain_text)
     text_to_translate = " ".join(part for is_text, part in parts if is_text).strip()
@@ -132,7 +132,7 @@ def translate_line_claude(claude_key, text, episode_synopsis, previous_context, 
         prompt += f" Previous Dialogue Context (for context only): {previous_context}."
     prompt += f" Now, translate this: {text_to_translate}\n\nAssistant:"
     headers = {"Content-Type": "application/json", "x-api-key": claude_key}
-    payload = {"prompt": prompt, "model": "claude-v1", "max_tokens_to_sample": 300, "temperature": 1.0}
+    payload = {"prompt": prompt, "model": model, "max_tokens_to_sample": 300, "temperature": 1.0}
     logger.debug(f"Claude request prompt:\n{prompt}")
     try:
         if not VERBOSE:
@@ -158,6 +158,12 @@ def main():
     openai_key = os.getenv("OPENAI_API_KEY")
     claude_key = os.getenv("CLAUDE_API_KEY")
     deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+    
+    # Model configuration from .env
+    openai_model = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+    claude_model = os.getenv("CLAUDE_MODEL", "claude-v1")
+    deepseek_model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    
     available_keys = {}
     if openai_key:
         available_keys["openai"] = openai_key
@@ -209,11 +215,17 @@ def main():
     if ai_choice in ["openai", "deepseek"]:
         if ai_choice == "openai":
             client = OpenAI(api_key=available_keys["openai"], base_url="https://api.openai.com")
+            model = openai_model
         else:
             client = OpenAI(api_key=available_keys["deepseek"], base_url="https://api.deepseek.com")
-        translate_func = lambda text, ep_syn, prev_ctx, orig_lang, tgt_lang: translate_line_openai(client, text, ep_syn, prev_ctx, orig_lang, tgt_lang)
+            model = deepseek_model
+        translate_func = lambda text, ep_syn, prev_ctx, orig_lang, tgt_lang: translate_line_openai(
+            client, text, ep_syn, prev_ctx, orig_lang, tgt_lang, model
+        )
     elif ai_choice == "claude":
-        translate_func = lambda text, ep_syn, prev_ctx, orig_lang, tgt_lang: translate_line_claude(available_keys["claude"], text, ep_syn, prev_ctx, orig_lang, tgt_lang)
+        translate_func = lambda text, ep_syn, prev_ctx, orig_lang, tgt_lang: translate_line_claude(
+            available_keys["claude"], text, ep_syn, prev_ctx, orig_lang, tgt_lang, claude_model
+        )
     else:
         logger.error("Invalid AI choice.")
         return
