@@ -13,6 +13,7 @@ import http.client
 import requests
 from tqdm import tqdm
 import csv
+from mistralai import Mistral
 
 openai.log = "error"
 
@@ -182,6 +183,63 @@ def translate_line_claude(claude_key, text, episode_synopsis, previous_context, 
     completion = postprocess_translation(completion)
     return f"{formatting_codes}{completion}"
 
+def translate_line_mistral(client, text, episode_synopsis, previous_context, original_language, target_language, model, temperature=1.0):
+    formatting_codes, plain_text = extract_leading_formatting(text)
+    parts = split_text_with_formatting(plain_text)
+    text_to_translate = " ".join(part for is_text, part in parts if is_text).strip()
+    
+    system_message = (
+        f"Translate the following subtitle text from {original_language} to {target_language}. "
+        "Translate only the plain text and do not include any formatting codes. "
+        "Do not add any extra commentary. Your output must contain only the translation of the provided text; "
+        "do not include the context below in your output."
+    )
+    if episode_synopsis:
+        system_message += f"\nEpisode Synopsis (for context only): {episode_synopsis}"
+    if previous_context:
+        system_message += f"\nPrevious Dialogue Context (for context only): {previous_context}"
+    
+    messages = [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": text_to_translate}
+    ]
+    
+    logger.debug(f"Request messages for line:\nSystem: {system_message}\nUser: {text_to_translate}")
+    
+    try:
+        if not VERBOSE:
+            with suppress_fd_output():
+                response = client.chat.complete(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=8192,
+                )
+        else:
+            response = client.chat.complete(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=8192,
+            )
+        
+        if response and hasattr(response, 'choices') and response.choices and len(response.choices) > 0:
+            translation_text = response.choices[0].message.content.strip()
+            logger.debug(f"Raw translation response: {translation_text}")
+        else:
+            logger.error(f"Invalid response for text: {text}. Response: {response}")
+            return None
+    except Exception as e:
+        logger.error(f"Error during Mistral API call: {e}")
+        return None
+    
+    if not translation_text:
+        logger.error("Empty translation received")
+        return None
+    
+    translation_text = postprocess_translation(translation_text)
+    return f"{formatting_codes}{translation_text}"
+
 def main():
     global VERBOSE
     load_dotenv()
@@ -189,10 +247,12 @@ def main():
     claude_key = os.getenv("CLAUDE_API_KEY")
     deepseek_key = os.getenv("DEEPSEEK_API_KEY")
     openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    mistral_key = os.getenv("MISTRAL_API_KEY")
     openai_model = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
     claude_model = os.getenv("CLAUDE_MODEL", "claude-v1")
     deepseek_model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
     openrouter_model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat:free")
+    mistral_model = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
     available_keys = {}
     if openai_key:
         available_keys["openai"] = openai_key
@@ -202,19 +262,21 @@ def main():
         available_keys["deepseek"] = deepseek_key
     if openrouter_key:
         available_keys["openrouter"] = openrouter_key
+    if mistral_key:
+        available_keys["mistral"] = mistral_key
     if not available_keys:
-        logger.error("No API keys found in .env file. Please set at least one of OPENAI_API_KEY, CLAUDE_API_KEY, DEEPSEEK_API_KEY, or OPENROUTER_API_KEY.")
+        logger.error("No API keys found in .env file. Please set at least one of OPENAI_API_KEY, CLAUDE_API_KEY, DEEPSEEK_API_KEY, OPENROUTER_API_KEY, or MISTRAL_API_KEY.")
         return
     parser = argparse.ArgumentParser(
         description="Translate subtitle files (.ass, .srt) line-by-line with context using an AI API. "
-                    "Supports OpenAI, Claude, DeepSeek, and OpenRouter. For ASS files, the header is preserved."
+                    "Supports OpenAI, Claude, DeepSeek, OpenRouter, and Mistral."
     )
     parser.add_argument("input_files", nargs='+', help="Path to input subtitle files (.ass or .srt)")
     parser.add_argument("--target-language", required=True, help="Target language code (e.g., 'en')")
     parser.add_argument(
         "--ai",
-        choices=["openai", "claude", "deepseek", "openrouter"],
-        help="Which AI provider to use (openai, claude, deepseek, openrouter)"
+        choices=["openai", "claude", "deepseek", "openrouter", "mistral"],
+        help="Which AI provider to use (openai, claude, deepseek, openrouter, mistral)"
     )
     parser.add_argument("--model", help="Specify the model to use, overrides default from .env")
     parser.add_argument("--temperature", type=float, default=1.3, help="Set the temperature for translation (0.0 to 2.0)")
@@ -239,7 +301,7 @@ def main():
         logger.info(f"Only {ai_choice} API key found. Using {ai_choice}.")
     else:
         if not args.ai:
-            logger.error("Multiple API keys found. Please specify which AI to use with the --ai argument (openai, claude, deepseek, openrouter).")
+            logger.error("Multiple API keys found. Please specify which AI to use with the --ai argument.")
             return
         ai_choice = args.ai
         if ai_choice not in available_keys:
@@ -274,6 +336,8 @@ def main():
             model = args.model if args.model else deepseek_model
         elif ai_choice == "openrouter":
             model = args.model if args.model else openrouter_model
+        elif ai_choice == "mistral":
+            model = args.model if args.model else mistral_model
         if ai_choice in ["openai", "deepseek", "openrouter"]:
             if ai_choice == "openai":
                 client = OpenAI(api_key=available_keys["openai"], base_url="https://api.openai.com")
@@ -293,6 +357,12 @@ def main():
         elif ai_choice == "claude":
             translate_func = lambda text, ep_syn, prev_ctx, orig_lang, tgt_lang: translate_line_claude(
                 available_keys["claude"], text, ep_syn, prev_ctx, orig_lang, tgt_lang, model, temperature=args.temperature
+            )
+        elif ai_choice == "mistral":
+            model = args.model if args.model else mistral_model
+            client = Mistral(api_key=available_keys["mistral"])
+            translate_func = lambda text, ep_syn, prev_ctx, orig_lang, tgt_lang: translate_line_mistral(
+                client, text, ep_syn, prev_ctx, orig_lang, tgt_lang, model, temperature=args.temperature
             )
         episode_synopsis = args.context
         if args.context_file:
