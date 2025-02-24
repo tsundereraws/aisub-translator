@@ -12,6 +12,8 @@
 - **Live Output Updates:** The output file is updated live as each line is processed.
 - **Clean Logging:** Console messages omit formatting codes (e.g. `{\an8}`) for readability.
 - **Easy Configuration:** API keys and model selection managed via `.env` file.
+- **Post-Translation Review File:** For each input file, a CSV review file (e.g., filename_en_review.csv) is generated, containing columns for line number, original text, and translated text.
+- **Multiple File Translation:** The input_file argument is renamed to `input_files` with `nargs='+'`, allowing one or more subtitle files to be processed.
 
 ## Requirements
 - Tested on Python 3.13.1
@@ -39,7 +41,7 @@ OPENROUTER_MODEL=deepseek/deepseek-chat:free
 
 ## Usage
 Run the script from the command line with the following arguments:
-```python aisub-translator.py input_file.ass --target-language en --ai deepseek```
+```python aisub-translator.py input1.srt input2.srt --target-language en --ai openai --model gpt-4 --temperature 1.0 --context "Episode about a samurai's journey."```
 
 ### Command Line Arguments:
 - `input_file`: Path to the subtitle file (`.ass` or `.srt`)
@@ -49,6 +51,9 @@ Run the script from the command line with the following arguments:
 - `--context-file`: Path to a file containing the episode synopsis
 - `--output-file`: Path to save the translated subtitle file
 - `--verbose`: Enable verbose logging (including debug output)
+- `--model`: Choose a specific model that overrites the one in `.env`
+- `--temperature`: Choose a specific temperature suited for your needs, by default is set to `1.3`
+  
 
 ## API Providers
 - **OpenAI:** Uses official OpenAI API with configurable model via `OPENAI_MODEL` (default: `gpt-3.5-turbo`)
