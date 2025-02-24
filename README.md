@@ -68,7 +68,7 @@ Run the script from the command line with the following arguments:
 - **Using Claude 3 with episode synopsis:**
 ```python aisub-translator.py episode.srt --target-language fr --ai claude --context "Episode synopsis goes here."```
 
-![Example](https://i.ibb.co/5XRMDfYJ/image.png)
+![Example](https://i.ibb.co/WvVdtKkX/image.png)
 
 ## ASS File Handling
 For ASS files, the script automatically preserves all header information (script info, styles, etc.). Only the dialogue text (the part after the `Dialogue:` field's initial settings) is translated.
