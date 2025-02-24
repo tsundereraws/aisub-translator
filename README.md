@@ -48,7 +48,7 @@ Run the script from the command line with the following arguments:
 ### Command Line Arguments:
 - `input_file`: Path to the subtitle file (`.ass` or `.srt`)
 - `--target-language`: Target language code (e.g. `en` for English)
-- `--ai`: AI provider to use. Valid values: `openai`, `claude`, `deepseek`, `openrouter`.
+- `--ai`: AI provider to use. Valid values: `openai`, `claude`, `deepseek`, `openrouter`, `mistral`.
 - `--context`: Episode synopsis for the current film/episode (already translated)
 - `--context-file`: Path to a file containing the episode synopsis
 - `--output-file`: Path to save the translated subtitle file
