@@ -69,7 +69,23 @@ def extract_leading_formatting(text):
 def postprocess_translation(translation_text):
     return re.sub(r'\s*\{\(.*?\)\}', '', translation_text)
 
-def translate_line_openai(client, text, episode_synopsis, previous_context, original_language, target_language, model):
+def translate_line_openai(client, text, episode_synopsis, previous_context, original_language, target_language, model, extra_headers=None):
+    """
+    Translate a subtitle line using an OpenAI-compatible API (OpenAI, DeepSeek, or OpenRouter).
+
+    Args:
+        client: OpenAI client instance.
+        text: The subtitle text to translate.
+        episode_synopsis: Episode synopsis for context.
+        previous_context: Previous dialogue context.
+        original_language: Source language code.
+        target_language: Target language code.
+        model: The model to use for translation.
+        extra_headers: Optional extra headers to include in the API request (e.g., for OpenRouter).
+
+    Returns:
+        Translated text or None if translation fails.
+    """
     formatting_codes, plain_text = extract_leading_formatting(text)
     parts = split_text_with_formatting(plain_text)
     text_to_translate = " ".join(part for is_text, part in parts if is_text).strip()
@@ -96,7 +112,8 @@ def translate_line_openai(client, text, episode_synopsis, previous_context, orig
                     messages=messages,
                     stream=False,
                     max_tokens=8192,
-                    temperature=1.3
+                    temperature=1.3,
+                    extra_headers=extra_headers  # Pass extra_headers to the API call
                 )
         else:
             response = client.chat.completions.create(
@@ -104,10 +121,16 @@ def translate_line_openai(client, text, episode_synopsis, previous_context, orig
                 messages=messages,
                 stream=False,
                 max_tokens=8192,
-                temperature=1.3
+                temperature=1.3,
+                extra_headers=extra_headers  # Pass extra_headers to the API call
             )
-        translation_text = response.choices[0].message.content.strip()
-        logger.debug(f"Raw translation response: {translation_text}")
+        # Check if response and response.choices are valid before accessing
+        if response and hasattr(response, 'choices') and len(response.choices) > 0:
+            translation_text = response.choices[0].message.content.strip()
+            logger.debug(f"Raw translation response: {translation_text}")
+        else:
+            logger.error(f"Invalid response for text: {text}")
+            return None
     except Exception as e:
         logger.error(f"API request failed for text: {text} with error: {e}")
         return None
@@ -155,15 +178,20 @@ def translate_line_claude(claude_key, text, episode_synopsis, previous_context, 
 def main():
     global VERBOSE
     load_dotenv()
+    
+    # Load API keys from environment variables
     openai_key = os.getenv("OPENAI_API_KEY")
     claude_key = os.getenv("CLAUDE_API_KEY")
     deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
     
-    # Model configuration from .env
+    # Load model configurations from .env
     openai_model = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
     claude_model = os.getenv("CLAUDE_MODEL", "claude-v1")
     deepseek_model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    openrouter_model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat:free")  # Default to free model if not specified
     
+    # Add available API keys to the dictionary
     available_keys = {}
     if openai_key:
         available_keys["openai"] = openai_key
@@ -171,17 +199,23 @@ def main():
         available_keys["claude"] = claude_key
     if deepseek_key:
         available_keys["deepseek"] = deepseek_key
+    if openrouter_key:
+        available_keys["openrouter"] = openrouter_key
     if not available_keys:
-        logger.error("No API keys found in .env file. Please set at least one of OPENAI_API_KEY, CLAUDE_API_KEY, or DEEPSEEK_API_KEY.")
+        logger.error("No API keys found in .env file. Please set at least one of OPENAI_API_KEY, CLAUDE_API_KEY, DEEPSEEK_API_KEY, or OPENROUTER_API_KEY.")
         return
 
     parser = argparse.ArgumentParser(
         description="Translate subtitle files (.ass, .srt) line-by-line with context using an AI API. "
-                    "Supports OpenAI, Claude, and DeepSeek. For ASS files, the header is preserved."
+                    "Supports OpenAI, Claude, DeepSeek, and OpenRouter. For ASS files, the header is preserved."
     )
     parser.add_argument("input_file", help="Path to input subtitle file (.ass or .srt)")
     parser.add_argument("--target-language", required=True, help="Target language code (e.g., 'en')")
-    parser.add_argument("--ai", choices=["openai", "claude", "deepseek"], help="Which AI provider to use (openai, claude, deepseek)")
+    parser.add_argument(
+        "--ai",
+        choices=["openai", "claude", "deepseek", "openrouter"],
+        help="Which AI provider to use (openai, claude, deepseek, openrouter)"
+    )
     parser.add_argument("--context", help="Episode synopsis for the current film/episode (already translated)")
     parser.add_argument("--context-file", help="File with episode synopsis")
     parser.add_argument("--output-file", help="Path to save the translated file")
@@ -205,22 +239,32 @@ def main():
         logger.info(f"Only {ai_choice} API key found. Using {ai_choice}.")
     else:
         if not args.ai:
-            logger.error("Multiple API keys found. Please specify which AI to use with the --ai argument (openai, claude, deepseek).")
+            logger.error("Multiple API keys found. Please specify which AI to use with the --ai argument (openai, claude, deepseek, openrouter).")
             return
         ai_choice = args.ai
         if ai_choice not in available_keys:
             logger.error(f"API key for {ai_choice} is not available. Available keys: {', '.join(available_keys.keys())}")
             return
 
-    if ai_choice in ["openai", "deepseek"]:
+    # Configure client and translation function based on AI choice
+    if ai_choice in ["openai", "deepseek", "openrouter"]:
         if ai_choice == "openai":
             client = OpenAI(api_key=available_keys["openai"], base_url="https://api.openai.com")
             model = openai_model
-        else:
+            extra_headers = None
+        elif ai_choice == "deepseek":
             client = OpenAI(api_key=available_keys["deepseek"], base_url="https://api.deepseek.com")
             model = deepseek_model
+            extra_headers = None
+        elif ai_choice == "openrouter":
+            client = OpenAI(api_key=available_keys["openrouter"], base_url="https://openrouter.ai/api/v1")
+            model = openrouter_model  # Use the model specified in .env or default to "deepseek/deepseek-chat:free"
+            extra_headers = {
+                "HTTP-Referer": "https://example.com",  # Optional: Replace with your actual site URL
+                "X-Title": "Subtitle Translator",  # Optional: Replace with your actual site name
+            }
         translate_func = lambda text, ep_syn, prev_ctx, orig_lang, tgt_lang: translate_line_openai(
-            client, text, ep_syn, prev_ctx, orig_lang, tgt_lang, model
+            client, text, ep_syn, prev_ctx, orig_lang, tgt_lang, model, extra_headers
         )
     elif ai_choice == "claude":
         translate_func = lambda text, ep_syn, prev_ctx, orig_lang, tgt_lang: translate_line_claude(
