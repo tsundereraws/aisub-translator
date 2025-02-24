@@ -11,6 +11,8 @@ import openai
 from openai import OpenAI
 import http.client
 import requests
+from tqdm import tqdm
+import csv
 
 openai.log = "error"
 
@@ -69,23 +71,7 @@ def extract_leading_formatting(text):
 def postprocess_translation(translation_text):
     return re.sub(r'\s*\{\(.*?\)\}', '', translation_text)
 
-def translate_line_openai(client, text, episode_synopsis, previous_context, original_language, target_language, model, extra_headers=None):
-    """
-    Translate a subtitle line using an OpenAI-compatible API (OpenAI, DeepSeek, or OpenRouter).
-
-    Args:
-        client: OpenAI client instance.
-        text: The subtitle text to translate.
-        episode_synopsis: Episode synopsis for context.
-        previous_context: Previous dialogue context.
-        original_language: Source language code.
-        target_language: Target language code.
-        model: The model to use for translation.
-        extra_headers: Optional extra headers to include in the API request (e.g., for OpenRouter).
-
-    Returns:
-        Translated text or None if translation fails.
-    """
+def translate_line_openai(client, text, episode_synopsis, previous_context, original_language, target_language, model, extra_headers=None, temperature=1.3):
     formatting_codes, plain_text = extract_leading_formatting(text)
     parts = split_text_with_formatting(plain_text)
     text_to_translate = " ".join(part for is_text, part in parts if is_text).strip()
@@ -112,8 +98,8 @@ def translate_line_openai(client, text, episode_synopsis, previous_context, orig
                     messages=messages,
                     stream=False,
                     max_tokens=8192,
-                    temperature=1.3,
-                    extra_headers=extra_headers  # Pass extra_headers to the API call
+                    temperature=temperature,
+                    extra_headers=extra_headers
                 )
         else:
             response = client.chat.completions.create(
@@ -121,18 +107,26 @@ def translate_line_openai(client, text, episode_synopsis, previous_context, orig
                 messages=messages,
                 stream=False,
                 max_tokens=8192,
-                temperature=1.3,
-                extra_headers=extra_headers  # Pass extra_headers to the API call
+                temperature=temperature,
+                extra_headers=extra_headers
             )
-        # Check if response and response.choices are valid before accessing
         if response and hasattr(response, 'choices') and len(response.choices) > 0:
             translation_text = response.choices[0].message.content.strip()
             logger.debug(f"Raw translation response: {translation_text}")
         else:
             logger.error(f"Invalid response for text: {text}")
             return None
+    except openai.RateLimitError as e:
+        logger.error(f"Rate limit exceeded: {e}")
+        return None
+    except openai.AuthenticationError as e:
+        logger.error(f"Authentication error: {e}")
+        return None
+    except openai.APIError as e:
+        logger.error(f"API error: {e}")
+        return None
     except Exception as e:
-        logger.error(f"API request failed for text: {text} with error: {e}")
+        logger.error(f"Unexpected error: {e}")
         return None
     if not translation_text:
         logger.error("Empty translation received")
@@ -140,7 +134,7 @@ def translate_line_openai(client, text, episode_synopsis, previous_context, orig
     translation_text = postprocess_translation(translation_text)
     return f"{formatting_codes}{translation_text}"
 
-def translate_line_claude(claude_key, text, episode_synopsis, previous_context, original_language, target_language, model):
+def translate_line_claude(claude_key, text, episode_synopsis, previous_context, original_language, target_language, model, temperature=1.0):
     formatting_codes, plain_text = extract_leading_formatting(text)
     parts = split_text_with_formatting(plain_text)
     text_to_translate = " ".join(part for is_text, part in parts if is_text).strip()
@@ -155,7 +149,12 @@ def translate_line_claude(claude_key, text, episode_synopsis, previous_context, 
         prompt += f" Previous Dialogue Context (for context only): {previous_context}."
     prompt += f" Now, translate this: {text_to_translate}\n\nAssistant:"
     headers = {"Content-Type": "application/json", "x-api-key": claude_key}
-    payload = {"prompt": prompt, "model": model, "max_tokens_to_sample": 300, "temperature": 1.0}
+    payload = {
+        "prompt": prompt,
+        "model": model,
+        "max_tokens_to_sample": 300,
+        "temperature": temperature
+    }
     logger.debug(f"Claude request prompt:\n{prompt}")
     try:
         if not VERBOSE:
@@ -166,8 +165,16 @@ def translate_line_claude(claude_key, text, episode_synopsis, previous_context, 
         response.raise_for_status()
         data = response.json()
         completion = data.get("completion", "").strip()
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 429:
+            logger.error("Rate limit exceeded")
+        elif e.response.status_code == 401:
+            logger.error("Authentication error")
+        else:
+            logger.error(f"API error: {e.response.status_code} - {e.response.text}")
+        return None
     except Exception as e:
-        logger.error(f"Claude API request failed for text: {text} with error: {e}")
+        logger.error(f"Unexpected error: {e}")
         return None
     if not completion:
         logger.error("Empty completion received from Claude")
@@ -178,20 +185,14 @@ def translate_line_claude(claude_key, text, episode_synopsis, previous_context, 
 def main():
     global VERBOSE
     load_dotenv()
-    
-    # Load API keys from environment variables
     openai_key = os.getenv("OPENAI_API_KEY")
     claude_key = os.getenv("CLAUDE_API_KEY")
     deepseek_key = os.getenv("DEEPSEEK_API_KEY")
     openrouter_key = os.getenv("OPENROUTER_API_KEY")
-    
-    # Load model configurations from .env
     openai_model = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
     claude_model = os.getenv("CLAUDE_MODEL", "claude-v1")
     deepseek_model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-    openrouter_model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat:free")  # Default to free model if not specified
-    
-    # Add available API keys to the dictionary
+    openrouter_model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat:free")
     available_keys = {}
     if openai_key:
         available_keys["openai"] = openai_key
@@ -204,24 +205,24 @@ def main():
     if not available_keys:
         logger.error("No API keys found in .env file. Please set at least one of OPENAI_API_KEY, CLAUDE_API_KEY, DEEPSEEK_API_KEY, or OPENROUTER_API_KEY.")
         return
-
     parser = argparse.ArgumentParser(
         description="Translate subtitle files (.ass, .srt) line-by-line with context using an AI API. "
                     "Supports OpenAI, Claude, DeepSeek, and OpenRouter. For ASS files, the header is preserved."
     )
-    parser.add_argument("input_file", help="Path to input subtitle file (.ass or .srt)")
+    parser.add_argument("input_files", nargs='+', help="Path to input subtitle files (.ass or .srt)")
     parser.add_argument("--target-language", required=True, help="Target language code (e.g., 'en')")
     parser.add_argument(
         "--ai",
         choices=["openai", "claude", "deepseek", "openrouter"],
         help="Which AI provider to use (openai, claude, deepseek, openrouter)"
     )
+    parser.add_argument("--model", help="Specify the model to use, overrides default from .env")
+    parser.add_argument("--temperature", type=float, default=1.3, help="Set the temperature for translation (0.0 to 2.0)")
     parser.add_argument("--context", help="Episode synopsis for the current film/episode (already translated)")
     parser.add_argument("--context-file", help="File with episode synopsis")
-    parser.add_argument("--output-file", help="Path to save the translated file")
+    parser.add_argument("--output-file", help="Path to save the translated file (only for single input file)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     args = parser.parse_args()
-
     VERBOSE = args.verbose
     if args.verbose:
         logger.setLevel(logging.DEBUG)
@@ -233,7 +234,6 @@ def main():
             http.client.HTTPConnection.debuglevel = 0
         except Exception:
             pass
-
     if len(available_keys) == 1:
         ai_choice = next(iter(available_keys))
         logger.info(f"Only {ai_choice} API key found. Using {ai_choice}.")
@@ -245,105 +245,104 @@ def main():
         if ai_choice not in available_keys:
             logger.error(f"API key for {ai_choice} is not available. Available keys: {', '.join(available_keys.keys())}")
             return
-
-    # Configure client and translation function based on AI choice
-    if ai_choice in ["openai", "deepseek", "openrouter"]:
-        if ai_choice == "openai":
-            client = OpenAI(api_key=available_keys["openai"], base_url="https://api.openai.com")
-            model = openai_model
-            extra_headers = None
-        elif ai_choice == "deepseek":
-            client = OpenAI(api_key=available_keys["deepseek"], base_url="https://api.deepseek.com")
-            model = deepseek_model
-            extra_headers = None
-        elif ai_choice == "openrouter":
-            client = OpenAI(api_key=available_keys["openrouter"], base_url="https://openrouter.ai/api/v1")
-            model = openrouter_model  # Use the model specified in .env or default to "deepseek/deepseek-chat:free"
-            extra_headers = {
-                "HTTP-Referer": "https://example.com",  # Optional: Replace with your actual site URL
-                "X-Title": "Subtitle Translator",  # Optional: Replace with your actual site name
-            }
-        translate_func = lambda text, ep_syn, prev_ctx, orig_lang, tgt_lang: translate_line_openai(
-            client, text, ep_syn, prev_ctx, orig_lang, tgt_lang, model, extra_headers
-        )
-    elif ai_choice == "claude":
-        translate_func = lambda text, ep_syn, prev_ctx, orig_lang, tgt_lang: translate_line_claude(
-            available_keys["claude"], text, ep_syn, prev_ctx, orig_lang, tgt_lang, claude_model
-        )
-    else:
-        logger.error("Invalid AI choice.")
-        return
-
-    ext = os.path.splitext(args.input_file)[1].lower()
-    if ext == ".vtt":
-        logger.error("VTT subtitle files are not supported. Please provide a .ass or .srt file.")
-        return
-    elif ext not in [".ass", ".srt"]:
-        logger.error("Unsupported subtitle file format. Please provide a .ass or .srt file.")
-        return
-
-    try:
-        subs = pysubs2.load(args.input_file)
-    except Exception as e:
-        logger.error(f"Failed to load subtitle file: {e}")
-        return
-
-    if ext == ".ass":
-        logger.info("ASS file detected: header (script info, styles, etc.) will be preserved; only dialogue text will be translated.")
-
-    all_text = " ".join(sub.text for sub in subs if sub.type == "Dialogue")
-    original_language = detect_language(all_text)
-    if not original_language:
-        logger.error("Failed to detect original language")
-        return
-    logger.info(f"Detected original language: {original_language}")
-
-    episode_synopsis = args.context
-    if args.context_file:
+    for input_file in args.input_files:
+        ext = os.path.splitext(input_file)[1].lower()
+        if ext not in [".ass", ".srt"]:
+            logger.error(f"Unsupported file format: {input_file}")
+            continue
         try:
-            with open(args.context_file, "r", encoding="utf-8") as f:
-                episode_synopsis = f.read()
+            subs = pysubs2.load(input_file)
         except Exception as e:
-            logger.error(f"Failed to read context file: {e}")
-            return
-
-    output_file = args.output_file or f"{os.path.splitext(args.input_file)[0]}_{args.target_language}{ext}"
-
-    previous_lines = []
-    line_number = 0
-    for sub in subs:
-        if sub.type == "Dialogue":
-            line_number += 1
-            if not remove_formatting(sub.text):
-                logger.info(f"Line {line_number} is empty (only formatting codes), skipping translation.")
-                continue
-
-            previous_context = "\n".join(line.text for line in previous_lines)
-            logger.info(f"Translating line {line_number}: {remove_formatting(sub.text)}")
-            if previous_context:
-                logger.debug(f"Previous Dialogue Context for line {line_number}:\n{previous_context}")
-            
-            translation = translate_func(sub.text, episode_synopsis, previous_context, original_language, args.target_language)
-            if translation is None:
-                logger.error(f"Translation failed for line: {remove_formatting(sub.text)}")
-                return
-            
-            logger.info(f"Translated line {line_number} to: {remove_formatting(translation)}")
-            sub.text = translation
-            
-            previous_lines.append(sub)
-            if len(previous_lines) > 5:
-                previous_lines.pop(0)
-            
+            logger.error(f"Failed to load subtitle file {input_file}: {e}")
+            continue
+        if len(args.input_files) == 1 and args.output_file:
+            output_file = args.output_file
+        else:
+            output_file = os.path.splitext(input_file)[0] + f"_{args.target_language}{ext}"
+        review_file = os.path.splitext(output_file)[0] + "_review.csv"
+        all_text = " ".join(sub.text for sub in subs if sub.type == "Dialogue")
+        original_language = detect_language(all_text)
+        if not original_language:
+            logger.error(f"Failed to detect original language for {input_file}")
+            continue
+        logger.info(f"Detected original language for {input_file}: {original_language}")
+        if ai_choice == "openai":
+            model = args.model if args.model else openai_model
+        elif ai_choice == "claude":
+            model = args.model if args.model else claude_model
+        elif ai_choice == "deepseek":
+            model = args.model if args.model else deepseek_model
+        elif ai_choice == "openrouter":
+            model = args.model if args.model else openrouter_model
+        if ai_choice in ["openai", "deepseek", "openrouter"]:
+            if ai_choice == "openai":
+                client = OpenAI(api_key=available_keys["openai"], base_url="https://api.openai.com")
+                extra_headers = None
+            elif ai_choice == "deepseek":
+                client = OpenAI(api_key=available_keys["deepseek"], base_url="https://api.deepseek.com")
+                extra_headers = None
+            elif ai_choice == "openrouter":
+                client = OpenAI(api_key=available_keys["openrouter"], base_url="https://openrouter.ai/api/v1")
+                extra_headers = {
+                    "HTTP-Referer": "https://example.com",
+                    "X-Title": "Subtitle Translator",
+                }
+            translate_func = lambda text, ep_syn, prev_ctx, orig_lang, tgt_lang: translate_line_openai(
+                client, text, ep_syn, prev_ctx, orig_lang, tgt_lang, model, extra_headers, temperature=args.temperature
+            )
+        elif ai_choice == "claude":
+            translate_func = lambda text, ep_syn, prev_ctx, orig_lang, tgt_lang: translate_line_claude(
+                available_keys["claude"], text, ep_syn, prev_ctx, orig_lang, tgt_lang, model, temperature=args.temperature
+            )
+        episode_synopsis = args.context
+        if args.context_file:
             try:
-                subs.save(output_file)
-                if args.verbose:
-                    logger.info(f"Output file updated: {output_file}")
+                with open(args.context_file, "r", encoding="utf-8") as f:
+                    episode_synopsis = f.read()
             except Exception as e:
-                logger.error(f"Failed to save translated subtitle: {e}")
-                return
-
-    logger.info(f"Final translated subtitle saved to {output_file}")
+                logger.error(f"Failed to read context file: {e}")
+                continue
+        total_lines = sum(1 for sub in subs if sub.type == "Dialogue")
+        pbar = tqdm(total=total_lines, desc=f"Translating {os.path.basename(input_file)}")
+        previous_lines = []
+        review_data = []
+        for sub in subs:
+            if sub.type == "Dialogue":
+                line_number = len(review_data) + 1
+                if not remove_formatting(sub.text):
+                    logger.info(f"Line {line_number} is empty, skipping translation.")
+                    pbar.update(1)
+                    continue
+                previous_context = "\n".join(line.text for line in previous_lines)
+                logger.info(f"Translating line {line_number}: {remove_formatting(sub.text)}")
+                if previous_context:
+                    logger.debug(f"Previous Dialogue Context for line {line_number}:\n{previous_context}")
+                translation = translate_func(sub.text, episode_synopsis, previous_context, original_language, args.target_language)
+                if translation is None:
+                    logger.error(f"Translation failed for line: {remove_formatting(sub.text)}")
+                    pbar.update(1)
+                    continue
+                logger.info(f"Translated line {line_number} to: {remove_formatting(translation)}")
+                sub.text = translation
+                review_data.append((line_number, remove_formatting(sub.text), remove_formatting(translation)))
+                previous_lines.append(sub)
+                if len(previous_lines) > 5:
+                    previous_lines.pop(0)
+                pbar.update(1)
+        try:
+            subs.save(output_file)
+            logger.info(f"Translated subtitle saved to {output_file}")
+        except Exception as e:
+            logger.error(f"Failed to save translated subtitle: {e}")
+        try:
+            with open(review_file, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Line Number", "Original Text", "Translated Text"])
+                for row in review_data:
+                    writer.writerow(row)
+            logger.info(f"Review file saved to {review_file}")
+        except Exception as e:
+            logger.error(f"Failed to save review file: {e}")
 
 if __name__ == "__main__":
     main()
