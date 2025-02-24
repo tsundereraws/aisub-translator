@@ -110,11 +110,11 @@ def translate_line_openai(client, text, episode_synopsis, previous_context, orig
                 temperature=temperature,
                 extra_headers=extra_headers
             )
-        if response and hasattr(response, 'choices') and len(response.choices) > 0:
+        if response and hasattr(response, 'choices') and response.choices is not None and isinstance(response.choices, list) and len(response.choices) > 0:
             translation_text = response.choices[0].message.content.strip()
             logger.debug(f"Raw translation response: {translation_text}")
         else:
-            logger.error(f"Invalid response for text: {text}")
+            logger.error(f"Invalid response for text: {text}. Response: {response}")
             return None
     except openai.RateLimitError as e:
         logger.error(f"Rate limit exceeded: {e}")
@@ -305,44 +305,50 @@ def main():
         total_lines = sum(1 for sub in subs if sub.type == "Dialogue")
         pbar = tqdm(total=total_lines, desc=f"Translating {os.path.basename(input_file)}")
         previous_lines = []
-        review_data = []
-        for sub in subs:
-            if sub.type == "Dialogue":
-                line_number = len(review_data) + 1
-                if not remove_formatting(sub.text):
-                    logger.info(f"Line {line_number} is empty, skipping translation.")
-                    pbar.update(1)
-                    continue
-                previous_context = "\n".join(line.text for line in previous_lines)
-                logger.info(f"Translating line {line_number}: {remove_formatting(sub.text)}")
-                if previous_context:
-                    logger.debug(f"Previous Dialogue Context for line {line_number}:\n{previous_context}")
-                translation = translate_func(sub.text, episode_synopsis, previous_context, original_language, args.target_language)
-                if translation is None:
-                    logger.error(f"Translation failed for line: {remove_formatting(sub.text)}")
-                    pbar.update(1)
-                    continue
-                logger.info(f"Translated line {line_number} to: {remove_formatting(translation)}")
-                sub.text = translation
-                review_data.append((line_number, remove_formatting(sub.text), remove_formatting(translation)))
-                previous_lines.append(sub)
-                if len(previous_lines) > 5:
-                    previous_lines.pop(0)
-                pbar.update(1)
-        try:
-            subs.save(output_file)
-            logger.info(f"Translated subtitle saved to {output_file}")
-        except Exception as e:
-            logger.error(f"Failed to save translated subtitle: {e}")
+        line_number = 0
+
+        # Write review CSV header before starting
         try:
             with open(review_file, 'w', encoding='utf-8', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(["Line Number", "Original Text", "Translated Text"])
-                for row in review_data:
-                    writer.writerow(row)
-            logger.info(f"Review file saved to {review_file}")
         except Exception as e:
-            logger.error(f"Failed to save review file: {e}")
+            logger.error(f"Failed to write review CSV header for {input_file}: {e}")
+            continue
+
+        for sub in subs:
+            if sub.type == "Dialogue":
+                line_number += 1
+                original_text = sub.text
+                if not remove_formatting(original_text):
+                    logger.info(f"Line {line_number} is empty, skipping translation.")
+                    pbar.update(1)
+                    continue
+                previous_context = "\n".join(line.text for line in previous_lines)
+                logger.info(f"Translating line {line_number}: {remove_formatting(original_text)}")
+                translation = translate_func(original_text, episode_synopsis, previous_context, original_language, args.target_language)
+                if translation is None:
+                    logger.error(f"Translation failed for line: {remove_formatting(original_text)}")
+                    pbar.update(1)
+                    continue
+                logger.info(f"Translated line {line_number} to: {remove_formatting(translation)}")
+                sub.text = translation
+                # Save subtitle file immediately after successful translation
+                try:
+                    subs.save(output_file)
+                except Exception as e:
+                    logger.error(f"Failed to save subtitle file after line {line_number}: {e}")
+                # Append to review CSV
+                try:
+                    with open(review_file, 'a', encoding='utf-8', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([line_number, remove_formatting(original_text), remove_formatting(translation)])
+                except Exception as e:
+                    logger.error(f"Failed to append to review CSV after line {line_number}: {e}")
+                previous_lines.append(sub)
+                if len(previous_lines) > 5:
+                    previous_lines.pop(0)
+                pbar.update(1)
 
 if __name__ == "__main__":
     main()
