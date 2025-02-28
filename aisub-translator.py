@@ -14,6 +14,9 @@ import requests
 from tqdm import tqdm
 import csv
 from mistralai import Mistral
+import ollama
+import typing
+import math
 
 openai.log = "error"
 
@@ -240,6 +243,62 @@ def translate_line_mistral(client, text, episode_synopsis, previous_context, ori
     translation_text = postprocess_translation(translation_text)
     return f"{formatting_codes}{translation_text}"
 
+def translate_line_ollama(client, text, episode_synopsis, previous_context, original_language, target_language, model, temperature=1.0):
+    formatting_codes, plain_text = extract_leading_formatting(text)
+    parts = split_text_with_formatting(plain_text)
+    text_to_translate = " ".join(part for is_text, part in parts if is_text).strip()
+    
+    system_message = (
+        f"Translate the following subtitle text from {original_language} to {target_language}. "
+        "Translate only the plain text and do not include any formatting codes. "
+        "Do not add any extra commentary. Your output must contain only the translation of the provided text; "
+        "do not include the context below in your output."
+    )
+    if episode_synopsis:
+        system_message += f"\nEpisode Synopsis (for context only): {episode_synopsis}"
+    if previous_context:
+        system_message += f"\nPrevious Dialogue Context (for context only): {previous_context}"
+    
+    messages = [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": text_to_translate}
+    ]
+    
+    logger.debug(f"Request messages for line:\nSystem: {system_message}\nUser: {text_to_translate}")
+    
+    try:
+        if not VERBOSE:
+            with suppress_fd_output():
+                response = client.chat(
+                    model=model,
+                    messages=messages,
+                    options=ollama.Options(temperature=temperature)
+                )
+        else:
+            response = client.chat(
+                    model=model,
+                    messages=messages,
+                    options=ollama.Options(temperature=temperature)
+                )
+        
+        if response:
+            translation_text = response.message.content.strip()
+            logger.debug(f"Raw translation response: {translation_text}")
+        else:
+            logger.error(f"Invalid response for text: {text}. Response: {response}")
+            return None
+    except Exception as e:
+        logger.error(f"Error during Ollama API call: {e}")
+        return None
+    
+    if not translation_text:
+        logger.error("Empty translation received")
+        return None
+    
+    translation_text = postprocess_translation(translation_text)
+    return f"{formatting_codes}{translation_text}"
+    
+
 def main():
     global VERBOSE
     load_dotenv()
@@ -248,11 +307,13 @@ def main():
     deepseek_key = os.getenv("DEEPSEEK_API_KEY")
     openrouter_key = os.getenv("OPENROUTER_API_KEY")
     mistral_key = os.getenv("MISTRAL_API_KEY")
+    ollama_url = os.getenv("OLLAMA_URL")
     openai_model = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
     claude_model = os.getenv("CLAUDE_MODEL", "claude-v1")
     deepseek_model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
     openrouter_model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat:free")
     mistral_model = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+    ollama_model = os.getenv("OLLAMA_MODEL", "mistral-small")
     available_keys = {}
     if openai_key:
         available_keys["openai"] = openai_key
@@ -264,8 +325,10 @@ def main():
         available_keys["openrouter"] = openrouter_key
     if mistral_key:
         available_keys["mistral"] = mistral_key
+    if ollama_url:
+        available_keys["ollama"] = ollama_url
     if not available_keys:
-        logger.error("No API keys found in .env file. Please set at least one of OPENAI_API_KEY, CLAUDE_API_KEY, DEEPSEEK_API_KEY, OPENROUTER_API_KEY, or MISTRAL_API_KEY.")
+        logger.error("No API keys found in .env file. Please set at least one of OPENAI_API_KEY, CLAUDE_API_KEY, DEEPSEEK_API_KEY, OPENROUTER_API_KEY, MISTRAL_API_KEY or OLLAMA_URL.")
         return
     parser = argparse.ArgumentParser(
         description="Translate subtitle files (.ass, .srt) line-by-line with context using an AI API. "
@@ -275,7 +338,7 @@ def main():
     parser.add_argument("--target-language", required=True, help="Target language code (e.g., 'en')")
     parser.add_argument(
         "--ai",
-        choices=["openai", "claude", "deepseek", "openrouter", "mistral"],
+        choices=["openai", "claude", "deepseek", "openrouter", "mistral", "ollama"],
         help="Which AI provider to use (openai, claude, deepseek, openrouter, mistral)"
     )
     parser.add_argument("--model", help="Specify the model to use, overrides default from .env")
@@ -338,6 +401,8 @@ def main():
             model = args.model if args.model else openrouter_model
         elif ai_choice == "mistral":
             model = args.model if args.model else mistral_model
+        elif ai_choice == "ollama":
+            model = args.model if args.model else ollama_model
         if ai_choice in ["openai", "deepseek", "openrouter"]:
             if ai_choice == "openai":
                 client = OpenAI(api_key=available_keys["openai"], base_url="https://api.openai.com")
@@ -363,6 +428,25 @@ def main():
             client = Mistral(api_key=available_keys["mistral"])
             translate_func = lambda text, ep_syn, prev_ctx, orig_lang, tgt_lang: translate_line_mistral(
                 client, text, ep_syn, prev_ctx, orig_lang, tgt_lang, model, temperature=args.temperature
+            )
+        elif ai_choice == "ollama":
+            model_name = args.model if args.model else ollama_model
+            if not any(model.model == model_name for model in ollama.list().models):
+                try:
+                    logger.info(f"Pulling model {model_name}")
+                    response = ollama.pull(model=model_name, stream=True)
+                    if isinstance(response, typing.Iterator):
+                        for progress in response:
+                            if progress.completed is not None and progress.completed is not None:
+                                logging.info(f"Pulling progress : [{'#' * math.trunc(progress.completed * 100 / progress.total)}{' ' * (100 - math.trunc(progress.completed * 100 / progress.total))}] - {(progress.completed) / 1000} MB / {progress.total/1000} MB")
+                except ollama.ResponseError as e:
+                    logger.error(f"Error pulling model {model_name}: {e}")
+                    exit()
+            client = ollama.Client(
+                host=available_keys["ollama"]
+            )
+            translate_func = lambda text, ep_syn, prev_ctx, orig_lang, tgt_lang: translate_line_ollama(
+                client, text, ep_syn, prev_ctx, orig_lang, tgt_lang, model_name, temperature=args.temperature
             )
         episode_synopsis = args.context
         if args.context_file:
