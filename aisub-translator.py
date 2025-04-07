@@ -405,7 +405,7 @@ def main():
             model = args.model if args.model else ollama_model
         if ai_choice in ["openai", "deepseek", "openrouter"]:
             if ai_choice == "openai":
-                client = OpenAI(api_key=available_keys["openai"], base_url="https://api.openai.com")
+                client = OpenAI(api_key=available_keys["openai"], base_url="https://api.openai.com/v1")
                 extra_headers = None
             elif ai_choice == "deepseek":
                 client = OpenAI(api_key=available_keys["deepseek"], base_url="https://api.deepseek.com")
